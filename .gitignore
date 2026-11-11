@@ -1,0 +1,23 @@
+# 构建产物
+out/
+classes/
+dexout/
+*.zip
+*.apk
+*.img
+
+# 工具链、SDK、离线包
+jdk/
+bt/
+platform/
+buildtools.zip
+platform-29.zip
+
+# 签名材料
+*.jks
+*.keystore
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
+desktop.ini

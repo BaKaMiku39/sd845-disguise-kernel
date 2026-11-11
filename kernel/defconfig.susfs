@@ -1,0 +1,40 @@
+# SUSFS 相关配置片段
+# 用法：追加到 arch/arm64/configs/dipper_user_defconfig 末尾
+# 完整说明见 docs/02-susfs.md
+
+CONFIG_KSU=y
+
+# SUSFS 本体
+CONFIG_KSU_SUSFS=y
+
+# 路径隐藏：让 /data/adb 下的内容对非 root 进程不可见
+CONFIG_KSU_SUSFS_SUS_PATH=y
+
+# 挂载隐藏：抹掉模块挂载痕迹
+CONFIG_KSU_SUSFS_SUS_MOUNT=y
+
+# inode 伪装：防 stat 对比
+CONFIG_KSU_SUSFS_SUS_KSTAT=y
+
+# 内核版本串伪装
+CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+
+# 隐藏 ksu/susfs 符号
+CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+
+# cmdline / bootconfig 伪装
+CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+
+# 文件读取重定向
+CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+
+# 内存映射隐藏：这是「注入了但看不见」的关键
+CONFIG_KSU_SUSFS_SUS_MAP=y
+
+# 版本串伪装
+CONFIG_LOCALVERSION="-perf-g3f9c1a7"
+# CONFIG_LOCALVERSION_AUTO is not set
+
+# 关掉编译配置泄漏
+# CONFIG_IKCONFIG is not set
+# CONFIG_IKCONFIG_PROC is not set
