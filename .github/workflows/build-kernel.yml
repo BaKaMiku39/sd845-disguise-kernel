@@ -202,5 +202,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: sd845-kernel
-          path: dipper-rc3-*.zip
+          path: sd845-kernel-*.zip
           retention-days: 7
