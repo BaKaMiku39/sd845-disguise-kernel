@@ -1,0 +1,8 @@
+# 统一换行符：Windows 下编辑也不能让 shell 脚本带上 CRLF，
+# 否则在 Android 上执行会报 ambiguous redirect / syntax error
+* text=auto eol=lf
+*.sh text eol=lf
+*.yml text eol=lf
+*.md text eol=lf
+*.java text eol=lf
+*.bat text eol=crlf
