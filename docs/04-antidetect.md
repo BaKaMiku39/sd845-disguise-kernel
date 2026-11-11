@@ -1,6 +1,6 @@
-# 04 · 反检测：把伪造点找对
+# 04 · 反检测分层，与调试模式的一次取舍
 
-这篇是整个项目的核心。方法只有一句：**先搞清楚这个值是谁产生的，再决定在哪一层动手。**
+这篇记录两件事：**反检测应该按层思考**，以及**「伪装调试模式」为什么最后被放弃，改用按需开关的做法**。后者比前者更有价值——它划出了一条容易被忽略的边界。
 
 ---
 
@@ -13,47 +13,15 @@
 | 进程层 | 自己的 maps、类结构、线程名、调试器状态 | 只能注入，**必然留痕** |
 | 应用层 | 签名、完整性、业务逻辑 | 静态改包或不碰 |
 
-前三层是「设备看起来怎样」，最后一层是「这个 App 自己算得对不对」。
+本身没有错。**错的是第二层的适用范围。**
 
 ---
 
-## 二、失败案例：把模块勾到检测器上
+## 二、尝试：在 system_server 里伪造 adb_enabled
 
-最初的做法很直觉：写个 Xposed 模块，hook `Settings.Global.getInt("adb_enabled")` 返回 0，然后**把作用域勾到 Momo 上**。
+### 动机
 
-结果：
-
-```
-环境异常
-  找到 Zygisk
-  发现代码注入
-  Zygote 被注入
-可疑痕迹
-  已开启调试模式
-```
-
-调试模式那条没消失，反而多出三条。日志说明了原因：
-
-```
-I LSPosed: Loading xposed for io.github.vvb2060.mahoshojo
-I LSPosed-Bridge: Loading legacy module com.local.adbhide
-I LSPosed: skip injecting into ...MahoService2 because it's isolated
-```
-
-两个关键信息：
-
-1. 模块确实加载了，但 Momo 的检测逻辑跑在**隔离进程**里（`isolated`），LSPosed 按设计不注入隔离进程——hook 根本没生效在关键位置。
-2. 一旦 LSPosed 注入 Momo，`/proc/self/maps` 里就有了我们的映射，`XposedBridge` 类也进了它的地址空间。检测器扫自己进程，一抓一个准。
-
-**结论：往检测器进程里塞代码，是必输的局。** 它能读内核、能扫自己的内存，你藏不住。
-
----
-
-## 三、正确做法：改数据源
-
-### 找到真正的数据源
-
-Momo 读调试开关，不管走哪条 API，最终都会落到 `SettingsProvider`。查一下它跑在哪：
+检测器报「已开启调试模式」，读的通常是 `Settings.Global.getInt("adb_enabled")`。查一下这个数据在哪：
 
 ```bash
 adb shell dumpsys activity providers | grep -A2 settings
@@ -64,95 +32,106 @@ adb shell dumpsys activity providers | grep -A2 settings
   package=com.android.providers.settings process=system
 ```
 
-`process=system` —— 它不在独立进程，**就在 `system_server` 里**。
+`process=system` —— `SettingsProvider` 跑在 `system_server` 里。于是想法很自然：只注入系统框架，在数据出口处按调用者身份分流，检测器拿到 0，系统拿到真值。
 
-于是可以只注入系统框架（`android`），在数据出口处拦截：
+### 第一次：直接注入检测器
 
-```java
-// 只勾「系统框架」作用域
-if ("android".equals(lp.processName) || "system".equals(lp.processName)) {
-    hookProvider(lp);
-}
+最直觉的做法——写个 Xposed 模块 hook `Settings.Global.getInt`，作用域勾到 Momo 上。
+
+结果：调试模式没藏住，反而多出三条。
+
+```
+环境异常
+  找到 Zygisk
+  发现代码注入
+  Zygote 被注入
 ```
 
-### 拦截点有两个
+日志里还有一行关键信息：
 
-Android 的 `Settings.Global.getInt()` 走的是 `ContentProvider.call("GET_global", name, args)`，不是 `query()`。两个都要拦：
-
-```java
-XposedBridge.hookAllMethods(sp, "query", hook);   // 直接查 URI 的路径
-XposedBridge.hookAllMethods(sp, "call",  hook);   // Settings.Global.getXxx 的路径
+```
+I LSPosed : skip injecting into io.github.vvb2060.mahoshojo:...MahoService2 because it's isolated
 ```
 
-URI 形态：`content://settings/global/adb_enabled`，判断 `getPathSegments()` 是否为 `[global, adb_enabled]`。
+Momo 的检测逻辑跑在**隔离进程**里，而 LSPosed 按设计不注入隔离进程。也就是说 hook 根本没落在关键位置，反而把自己的痕迹留在了能被扫描的进程里。
 
-### 关键：按调用者 uid 分流
+**教训一：注入即暴露。往检测器进程里塞代码，是必输的局。**
 
-不能无差别返回 0，否则 `adbd` 自己读到「调试已关闭」就会停掉，你就断了控制通道。
+### 第二、三次：改成按 uid / pid 分流
 
-```java
-private static boolean keepReal(int uid) {
-    return uid == 1000      // system，adbd 与开发者选项在这
-        || uid == 0         // root
-        || uid == 2000;     // shell，adb shell
-}
-
-if (keepReal(Binder.getCallingUid())) return;   // 放行，读真实值
-
-MatrixCursor c = new MatrixCursor(new String[]{"value"});
-c.addRow(new Object[]{"0"});                    // 其他所有调用者读到 0
-param.setResult(c);
-```
-
-`call()` 分支则返回：
+改为注入 `system_server`，拦截 `SettingsProvider.query()` 和 `call("GET_global", ...)`：
 
 ```java
-Bundle b = new Bundle();
-b.putString("value", "0");
-param.setResult(b);
+if (uid == 1000 || uid == 0 || uid == 2000) return;   // 系统、root、shell 放行
+// 其他返回 0
 ```
 
-### 结果
+装好、启用、重启，然后——
 
-| 谁在读 | 读到 | 为什么 |
-|---|---|---|
-| system_server 内部（adbd、开发者选项） | `1` | uid 1000，放行 |
-| `adb shell settings get` | `1` | uid 2000，放行 |
-| Momo / 其他 App | `0` | 被伪造 |
+**手机能正常开机，但 adb 彻底失联。**
 
-而且 **Momo 的进程里一行我们的代码都没有**：`maps` 干净、没有 `XposedBridge`、没有异常线程名。它读到的世界就是「调试没开」。
+Windows 里只剩：
 
----
+```
+WPD   MI 8   USB\VID_2717&PID_FF40\FD365EA1
+```
 
-## 四、验证方法
+`FF40` 是纯 MTP。USB 调试正常工作时应该是 `FF48`（MTP + ADB）。设备侧看：
 
 ```bash
-# 系统侧：真实值
-adb shell settings get global adb_enabled          # → 1
-
-# 应用侧：伪造值
-adb shell am force-stop io.github.vvb2060.mahoshojo
-adb shell am start -n io.github.vvb2060.mahoshojo/.home.HomeActivity
-# Momo 界面应当无条目
+getprop sys.usb.config     # mtp        ← 没有 adb
+getprop init.svc.adbd      # stopped
 ```
 
-对比实验很有价值：把作用域勾回 Momo，你会立刻看到那三条注入痕迹回来。这能证明「伪造点位置」比「hook 写得多巧」重要得多。
+### 为什么
+
+`UsbDeviceManager` 判断「要不要启动 adbd」，读的是**同一个** `adb_enabled`。它属于 `system_server` 自身逻辑，理论上会走「系统 uid 放行」那条路。但 `Binder.getCallingUid()` 在非跨进程调用时并不可靠——它返回的是当前线程上一次 binder 事务残留的值。`system_server` 的线程刚处理完某个应用的请求，接着自己读设置，就会读到那个应用的 uid，被误判成「普通应用」，拿到 0。
+
+第二版加了 `pid != myPid` 判断，仍不够：残留的 pid 可能是一个**真实存在的应用进程**，校验照样通过。
+
+第三版改成读 `/proc/<pid>/cmdline` 比对进程名，逻辑上已经不可能误伤 `system_server`（它自己的 cmdline 就是 `system_server`）——但启用后 adbd 依然不启动。
+
+**教训二：当「系统自己也依赖这个值」时，伪造它就是和系统对赌。判据写得再小心，只要有一次误判，代价就是失去 adb 控制通道。**
+
+于是这一项不再硬做，改成按需开关：平时关调试，Momo 全绿；要用 adb 时再开。代价为零，也不碰系统状态。
 
 ---
 
-## 五、局限
+## 三、怎么判断一个值能不能这样伪造
 
-- 只覆盖 `Settings.Global` 的读取路径。若检测器改读 `/proc`、`sysfs`，需要 SUSFS 的 `SUS_MAP` 或内核态拦截。
-- 按 uid 白名单放行是权宜之计。如果检测器以 system uid 运行（极少数情况），会被放行。
-- 修改系统框架意味着**每次改配置都要重启**，`system_server` 不会热加载模块。
+动手之前问三个问题：
+
+1. **这个值是谁写的？谁在读？** 用 `dumpsys` 把读写方都找出来，别只看检测器那一侧。
+2. **系统内部有没有依赖它做决策？** `adb_enabled` 决定 adbd 是否启动；`ro.boot.verifiedbootstate` 决定系统是否信任当前启动链。这类值不能碰。
+3. **伪造失败的代价是什么？** 如果失败会让你失去设备控制权（adb 断、无法解锁、无法回滚），就不值得做。
+
+按这个标准筛一遍：
+
+| 目标 | 系统是否自用 | 能不能伪造 |
+|---|---|---|
+| 模块目录、`uname`、`cmdline` | 否 | 可以（SUSFS 就是在做这个） |
+| 包列表、应用枚举 | 部分 | 可以，注意别影响系统服务 |
+| `adb_enabled` | **是**（adbd 启停） | 不要 |
 
 ---
 
-## 六、方法论：换个检测项怎么办
+## 四、日常怎么办
 
-1. **先问「这个值谁产生」**——内核？系统服务？App 自己？
-2. **能用 `dumpsys` 定位就定位**。`dumpsys activity providers`、`dumpsys package`、`dumpsys mount` 比盲猜快得多。
-3. **尽量不动目标进程**。只有在值是目标自己算出来的时候（签名校验、本地加密），才考虑注入，并且要接受「会被发现」这个前提。
-4. **验证要看两侧**：系统侧看真实值，应用侧看伪造值。只看一侧会误判。
+按代价从低到高：
 
-一句话总结这个项目：**不要和检测器比谁藏得好，去改它看到的世界。**
+1. **按需开关（本项目采用）。** 平时把 USB 调试关掉，Momo 全绿；需要用 adb 时打开，用完关掉。adb 本来就是临时工具，没人会一直挂着调试模式用手机。这一条的成本是零。
+2. **静态改包。** 反编译目标，改掉判断逻辑再重签。不注入、不留运行时痕迹，但要过签名校验和加固。
+3. **内核层。** 用 SUSFS 的 `SUS_MAP` 之类隐藏痕迹，或者更彻底地在 syscall 层做文章。工作量大，且需要重编内核。
+
+之所以把「按需开关」排在第一，是因为它不改变系统状态，也就没有把设备控制权搭进去的风险。**能不改的就不改，这是最省事也最安全的方案。**
+
+---
+
+## 五、方法论
+
+- **先问「这个值谁产生、谁消费」**，再决定在哪一层动手。`dumpsys` 比盲猜快得多。
+- **尽量不动目标进程。** 只有在值是目标自己算出来的时候（签名校验、本地加密），才值得注入，并且要接受「会被发现」。
+- **验证要看两侧**：系统侧看真实值，应用侧看伪造值。
+- **改数据源之前，先确认系统不靠它活着。**
+
+这次失败的真正价值，是让第二条边界变得具体：数据源不是随便挑的，**挑错了会把设备控制权一起搭进去**。
